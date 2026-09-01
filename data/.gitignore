@@ -1,0 +1,9 @@
+# The SQLite database is a local working artifact, not the record. Git cannot
+# diff or merge a binary blob, so committing it would give an unreviewable
+# history and unresolvable conflicts across machines.
+#
+# The durable, version-controlled record is bets.csv / odds_snapshots.csv,
+# written by `tools/history.py export` and read back by `... import`.
+*.db
+*.db-wal
+*.db-shm

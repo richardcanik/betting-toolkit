@@ -1,0 +1,330 @@
+#!/usr/bin/env python3
+"""Persistent history of every bet selected in this project.
+
+One SQLite file, ``data/bets.db``. Selections are appended when they are made,
+closed when the match finishes, and read back as calibration statistics. The
+schema and the meaning of each column are specified in specs/tracking.md.
+
+Naming note: ``bets.event_id`` and ``bets.bet_id`` are *Nike's* identifiers,
+carried so a row can always be matched back to the offer it came from.
+``odds_snapshots.bet_ref`` is this database's own ``bets.id``.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import os
+import sqlite3
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+DB_PATH = Path(
+    os.environ.get("BETTING_DB")
+    or Path(__file__).resolve().parent.parent / "data" / "bets.db"
+)
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS bets (
+    id          INTEGER PRIMARY KEY,
+    placed_at   TEXT NOT NULL,           -- when the selection was made (ISO 8601)
+    starts_at   TEXT,                    -- scheduled start of the event
+    sport       TEXT NOT NULL,
+    event       TEXT NOT NULL,           -- "Shelton B. vs Hurkacz H."
+    event_id    TEXT,                    -- Nike sportEventId
+    bet_id      TEXT,                    -- Nike betId
+    market      TEXT NOT NULL,
+    selection   TEXT NOT NULL,
+    odds_nike   REAL NOT NULL,           -- odds actually taken
+    odds_close  REAL,                    -- closing odds, filled in at close time
+    p_est_low   REAL NOT NULL,           -- fair probability, lower bound
+    p_est_high  REAL NOT NULL,           -- fair probability, upper bound
+    edge        REAL NOT NULL,           -- p_est_low - 1/odds_nike (conservative)
+    ev          REAL NOT NULL,           -- odds_nike * p_est_low - 1
+    stake       REAL NOT NULL DEFAULT 1.0,
+    confidence  TEXT NOT NULL CHECK (confidence IN ('low', 'medium', 'high')),
+    factors     TEXT,                    -- comma-separated drivers, see specs
+    note        TEXT,
+    result      TEXT CHECK (result IN ('win', 'loss', 'void')),
+    pnl         REAL,
+    settled_at  TEXT
+);
+
+CREATE TABLE IF NOT EXISTS odds_snapshots (
+    id       INTEGER PRIMARY KEY,
+    bet_ref  INTEGER NOT NULL REFERENCES bets(id) ON DELETE CASCADE,
+    taken_at TEXT NOT NULL,
+    odds     REAL NOT NULL,
+    source   TEXT NOT NULL DEFAULT 'nike'
+);
+
+CREATE INDEX IF NOT EXISTS idx_bets_open ON bets(result) WHERE result IS NULL;
+CREATE INDEX IF NOT EXISTS idx_snapshots_bet ON odds_snapshots(bet_ref);
+"""
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def connect() -> sqlite3.Connection:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.executescript(SCHEMA)
+    return conn
+
+
+def show(rows: list[sqlite3.Row] | list[dict], columns: list[str]) -> None:
+    records = [dict(r) for r in rows]
+    if not records:
+        print("(nothing yet)")
+        return
+    fmt = lambda v: "" if v is None else (f"{v:.3f}" if isinstance(v, float) else str(v))
+    widths = {c: max(len(c), *(len(fmt(r.get(c))) for r in records)) for c in columns}
+    print("  ".join(c.ljust(widths[c]) for c in columns))
+    print("  ".join("-" * widths[c] for c in columns))
+    for record in records:
+        print("  ".join(fmt(record.get(c)).ljust(widths[c]) for c in columns))
+
+
+# --- commands --------------------------------------------------------------
+
+
+def cmd_add(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    p_low, p_high = args.p_low, args.p_high if args.p_high is not None else args.p_low
+    if not 0 < p_low <= p_high < 1:
+        sys.exit("probabilities must satisfy 0 < p_low <= p_high < 1")
+    if args.odds <= 1:
+        sys.exit("odds must be greater than 1")
+
+    edge = p_low - 1 / args.odds
+    ev = args.odds * p_low - 1
+    cur = conn.execute(
+        """INSERT INTO bets (placed_at, starts_at, sport, event, event_id, bet_id,
+                             market, selection, odds_nike, p_est_low, p_est_high,
+                             edge, ev, stake, confidence, factors, note)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            now_iso(), args.starts_at, args.sport, args.event, args.event_id,
+            args.bet_id, args.market, args.selection, args.odds, p_low, p_high,
+            edge, ev, args.stake, args.confidence, args.factors, args.note,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO odds_snapshots (bet_ref, taken_at, odds, source) VALUES (?,?,?,?)",
+        (cur.lastrowid, now_iso(), args.odds, "nike"),
+    )
+    conn.commit()
+    print(f"#{cur.lastrowid}  edge {edge:+.1%}  EV {ev:+.1%}  {args.selection} @ {args.odds}")
+
+
+def cmd_snapshot(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    if conn.execute("SELECT 1 FROM bets WHERE id = ?", (args.id,)).fetchone() is None:
+        sys.exit(f"no bet #{args.id}")
+    conn.execute(
+        "INSERT INTO odds_snapshots (bet_ref, taken_at, odds, source) VALUES (?,?,?,?)",
+        (args.id, now_iso(), args.odds, args.source),
+    )
+    conn.commit()
+    print(f"#{args.id}  {args.source} @ {args.odds}")
+
+
+def cmd_close(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    row = conn.execute("SELECT * FROM bets WHERE id = ?", (args.id,)).fetchone()
+    if row is None:
+        sys.exit(f"no bet #{args.id}")
+    if row["result"] is not None:
+        sys.exit(f"#{args.id} is already settled as {row['result']}")
+
+    pnl = {"win": row["stake"] * (row["odds_nike"] - 1), "loss": -row["stake"], "void": 0.0}
+    conn.execute(
+        "UPDATE bets SET result = ?, pnl = ?, settled_at = ?, odds_close = COALESCE(?, odds_close) WHERE id = ?",
+        (args.result, pnl[args.result], now_iso(), args.odds_close, args.id),
+    )
+    if args.odds_close:
+        conn.execute(
+            "INSERT INTO odds_snapshots (bet_ref, taken_at, odds, source) VALUES (?,?,?,?)",
+            (args.id, now_iso(), args.odds_close, "nike-close"),
+        )
+    conn.commit()
+    print(f"#{args.id}  {args.result}  pnl {pnl[args.result]:+.2f}")
+
+
+def cmd_list(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    where, params = [], []
+    if not args.all:
+        where.append("result IS NULL")
+    if args.sport:
+        where.append("sport = ?")
+        params.append(args.sport)
+    clause = ("WHERE " + " AND ".join(where)) if where else ""
+    rows = conn.execute(f"SELECT * FROM bets {clause} ORDER BY starts_at, id", params).fetchall()
+    show(rows, ["id", "starts_at", "sport", "event", "market", "selection",
+                "odds_nike", "edge", "confidence", "result", "pnl"])
+
+
+def cmd_stats(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    params = [args.sport] if args.sport else []
+    clause = "WHERE result IS NOT NULL AND result != 'void'" + (" AND sport = ?" if args.sport else "")
+    rows = conn.execute(f"SELECT * FROM bets {clause}", params).fetchall()
+    if not rows:
+        print("no settled bets yet")
+        return
+
+    wins = sum(r["result"] == "win" for r in rows)
+    staked = sum(r["stake"] for r in rows)
+    pnl = sum(r["pnl"] for r in rows)
+    expected = sum(r["p_est_low"] for r in rows)
+    print(f"settled      {len(rows)}")
+    print(f"hit rate     {wins / len(rows):.1%}  (model expected {expected / len(rows):.1%})")
+    print(f"ROI          {pnl / staked:+.1%}  ({pnl:+.2f} units on {staked:.2f} staked)")
+
+    priced = [r for r in rows if r["odds_close"]]
+    if priced:
+        clv = sum(r["odds_nike"] / r["odds_close"] - 1 for r in priced) / len(priced)
+        beat = sum(r["odds_nike"] > r["odds_close"] for r in priced)
+        print(f"CLV          {clv:+.2%} average, beat the close {beat}/{len(priced)}")
+    else:
+        print("CLV          no closing odds recorded yet")
+
+    print("\ncalibration by stated confidence")
+    band = conn.execute(
+        f"""SELECT confidence, COUNT(*) n,
+                   AVG(result = 'win') hit, AVG(p_est_low) expected,
+                   SUM(pnl) / SUM(stake) roi
+            FROM bets {clause} GROUP BY confidence""", params).fetchall()
+    show(band, ["confidence", "n", "hit", "expected", "roi"])
+
+    print("\nfactor breakdown (which drivers actually work)")
+    counts: dict[str, list[int]] = {}
+    for row in rows:
+        for factor in (row["factors"] or "").split(","):
+            factor = factor.strip()
+            if not factor:
+                continue
+            tally = counts.setdefault(factor, [0, 0])
+            tally[0] += 1
+            tally[1] += row["result"] == "win"
+    show(
+        [{"factor": k, "n": v[0], "hit": v[1] / v[0]} for k, v in
+         sorted(counts.items(), key=lambda kv: -kv[1][0])],
+        ["factor", "n", "hit"],
+    )
+
+
+EXPORT_DIR = DB_PATH.parent
+TABLES = ("bets", "odds_snapshots")
+
+
+def columns_of(conn: sqlite3.Connection, table: str) -> list[str]:
+    return [r["name"] for r in conn.execute(f"PRAGMA table_info({table})")]
+
+
+def cmd_export(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    """Write the committed, reviewable copy of the history.
+
+    The database itself is a local artifact and is not version controlled -- a
+    SQLite file is an opaque blob that git cannot diff or merge. These CSVs are
+    the durable record, and `import` rebuilds the database from them.
+    """
+    target = Path(args.dir)
+    target.mkdir(parents=True, exist_ok=True)
+    for table in TABLES:
+        cols = columns_of(conn, table)
+        rows = conn.execute(f"SELECT * FROM {table} ORDER BY id").fetchall()
+        path = target / f"{table}.csv"
+        with open(path, "w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=cols)
+            writer.writeheader()
+            writer.writerows(dict(r) for r in rows)
+        print(f"{len(rows):4d} rows -> {path}")
+
+
+def cmd_import(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    """Rebuild the database from the committed CSVs, replacing its contents."""
+    source = Path(args.dir)
+    missing = [t for t in TABLES if not (source / f"{t}.csv").exists()]
+    if missing:
+        sys.exit(f"no export found for: {', '.join(missing)} in {source}")
+
+    existing = conn.execute("SELECT COUNT(*) FROM bets").fetchone()[0]
+    if existing and not args.force:
+        sys.exit(f"{DB_PATH} already holds {existing} bets; pass --force to replace them")
+
+    with conn:
+        conn.execute("DELETE FROM odds_snapshots")
+        conn.execute("DELETE FROM bets")
+        for table in TABLES:
+            cols = columns_of(conn, table)
+            with open(source / f"{table}.csv", newline="", encoding="utf-8") as handle:
+                rows = [
+                    tuple(r[c] if r.get(c) not in ("", None) else None for c in cols)
+                    for r in csv.DictReader(handle)
+                ]
+            if rows:
+                placeholders = ",".join("?" * len(cols))
+                conn.executemany(
+                    f"INSERT INTO {table} ({','.join(cols)}) VALUES ({placeholders})", rows
+                )
+            print(f"{len(rows):4d} rows <- {source / f'{table}.csv'}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("init", help="create data/bets.db")
+
+    p = sub.add_parser("add", help="record a selected bet")
+    p.add_argument("--sport", required=True)
+    p.add_argument("--event", required=True, help='"Shelton B. vs Hurkacz H."')
+    p.add_argument("--market", required=True)
+    p.add_argument("--selection", required=True)
+    p.add_argument("--odds", type=float, required=True)
+    p.add_argument("--p-low", type=float, required=True, help="fair probability, lower bound")
+    p.add_argument("--p-high", type=float, help="upper bound; defaults to --p-low")
+    p.add_argument("--confidence", choices=("low", "medium", "high"), required=True)
+    p.add_argument("--stake", type=float, default=1.0, help="units, default 1 (flat)")
+    p.add_argument("--factors", help="comma-separated drivers, e.g. 'fatigue,surface-form'")
+    p.add_argument("--starts-at")
+    p.add_argument("--event-id", help="Nike sportEventId")
+    p.add_argument("--bet-id", help="Nike betId")
+    p.add_argument("--note")
+
+    p = sub.add_parser("snapshot", help="record another odds observation for a bet")
+    p.add_argument("id", type=int)
+    p.add_argument("--odds", type=float, required=True)
+    p.add_argument("--source", default="nike")
+
+    p = sub.add_parser("close", help="settle a bet")
+    p.add_argument("id", type=int)
+    p.add_argument("result", choices=("win", "loss", "void"))
+    p.add_argument("--odds-close", type=float, help="closing odds, for CLV")
+
+    p = sub.add_parser("list", help="open bets, or --all")
+    p.add_argument("--all", action="store_true")
+    p.add_argument("--sport")
+
+    p = sub.add_parser("stats", help="hit rate, ROI, CLV, calibration")
+    p.add_argument("--sport")
+
+    p = sub.add_parser("export", help="write the committed CSV copy of the history")
+    p.add_argument("--dir", default=str(EXPORT_DIR))
+
+    p = sub.add_parser("import", help="rebuild the database from the committed CSVs")
+    p.add_argument("--dir", default=str(EXPORT_DIR))
+    p.add_argument("--force", action="store_true", help="replace a non-empty database")
+
+    args = parser.parse_args()
+    conn = connect()
+    if args.cmd == "init":
+        print(f"ready: {DB_PATH}")
+    else:
+        globals()[f"cmd_{args.cmd}"](conn, args)  # cmd_add, cmd_close, cmd_import, ...
+    conn.close()
+
+
+if __name__ == "__main__":
+    main()
