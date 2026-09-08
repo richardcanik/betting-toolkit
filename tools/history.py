@@ -222,6 +222,69 @@ def columns_of(conn: sqlite3.Connection, table: str) -> list[str]:
     return [r["name"] for r in conn.execute(f"PRAGMA table_info({table})")]
 
 
+def confidence_from_spread(spread: float) -> str:
+    """How much the exchange's fair price can be trusted.
+
+    The bid/offer spread is the honest width of the estimate: a market quoted
+    within two points is a firm number, one quoted eight points wide is barely a
+    number at all.
+    """
+    if spread <= 0.03:
+        return "high"
+    return "medium" if spread <= 0.06 else "low"
+
+
+def cmd_bulk_add(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    """Record a whole batch of selections from tools/consensus.py output.
+
+    Both sides of every priced match are recorded, not only the likely winner.
+    Calibration can only be checked across the full probability range, and a
+    record made only of favourites would answer a different, useless question.
+
+    Re-running on the same day is safe: a selection already stored for the same
+    Nike bet id is skipped rather than duplicated.
+    """
+    handle = sys.stdin if args.csv == "-" else open(args.csv, newline="", encoding="utf-8")
+    rows = list(csv.DictReader(handle))
+    if handle is not sys.stdin:
+        handle.close()
+
+    added = skipped = 0
+    for row in rows:
+        fair, spread = float(row["fair"]), float(row["spread"])
+        low = max(0.001, fair - spread / 2)      # conservative end of the estimate
+        high = min(0.999, fair + spread / 2)
+        existing = conn.execute(
+            "SELECT 1 FROM bets WHERE bet_id = ? AND selection = ?",
+            (row["bet_id"], row["selection"]),
+        ).fetchone()
+        if existing:
+            skipped += 1
+            continue
+        odds = float(row["odds"])
+        cur = conn.execute(
+            """INSERT INTO bets (placed_at, starts_at, sport, event, event_id, bet_id,
+                                 market, selection, odds_nike, p_est_low, p_est_high,
+                                 edge, ev, stake, confidence, factors, note)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                now_iso(), row["start"], row["sport"], row["event"], row["event_id"],
+                row["bet_id"], row["market"], row["selection"], odds, low, high,
+                low - 1 / odds, odds * low - 1, args.stake,
+                confidence_from_spread(spread), "exchange-consensus",
+                f"spread {spread:.4f}; fair {fair:.4f}",
+            ),
+        )
+        conn.execute(
+            "INSERT INTO odds_snapshots (bet_ref, taken_at, odds, source) VALUES (?,?,?,?)",
+            (cur.lastrowid, now_iso(), odds, "nike"),
+        )
+        added += 1
+    conn.commit()
+    stake_note = "papierovo (stake 0)" if args.stake == 0 else f"stake {args.stake}"
+    print(f"zapísaných {added}, preskočených ako duplicita {skipped}  [{stake_note}]")
+
+
 def cmd_export(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
     """Write the committed, reviewable copy of the history.
 
@@ -310,6 +373,11 @@ def main() -> None:
     p = sub.add_parser("stats", help="hit rate, ROI, CLV, calibration")
     p.add_argument("--sport")
 
+    p = sub.add_parser("bulk-add", help="record a batch from consensus.py CSV output")
+    p.add_argument("--csv", default="-", help="path, or - for stdin (default)")
+    p.add_argument("--stake", type=float, default=0.0,
+                   help="0 (default) records without money at stake")
+
     p = sub.add_parser("export", help="write the committed CSV copy of the history")
     p.add_argument("--dir", default=str(EXPORT_DIR))
 
@@ -322,7 +390,8 @@ def main() -> None:
     if args.cmd == "init":
         print(f"ready: {DB_PATH}")
     else:
-        globals()[f"cmd_{args.cmd}"](conn, args)  # cmd_add, cmd_close, cmd_import, ...
+        # subcommand names may contain hyphens; function names cannot
+        globals()[f"cmd_{args.cmd.replace('-', '_')}"](conn, args)
     conn.close()
 
 

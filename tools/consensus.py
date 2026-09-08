@@ -251,6 +251,7 @@ def compare(sport: str, depth: str, days: int, max_events: int,
                 continue
             out.append(
                 {
+                    "sport": sport,
                     "start": row["start"][:16],
                     "event": row["event"],
                     "selection": name,
@@ -298,8 +299,8 @@ def main() -> None:
     print(f"spárovaných ponúk: {len(rows)}", file=sys.stderr)
     nike_odds.emit(
         rows, args.format,
-        ["start", "event", "selection", "market", "odds", "implied", "fair",
-         "spread", "edge", "ev"],
+        ["sport", "start", "event", "selection", "market", "odds", "implied",
+         "fair", "spread", "edge", "ev", "event_id", "bet_id"],
     )
 
 
