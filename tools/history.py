@@ -138,10 +138,21 @@ def cmd_close(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
     if row["result"] is not None:
         sys.exit(f"#{args.id} is already settled as {row['result']}")
 
+    closing = args.odds_close
+    if closing is None and row["starts_at"]:
+        # The closing price is the last price seen before the event began.
+        last = conn.execute(
+            """SELECT odds FROM odds_snapshots
+               WHERE bet_ref = ? AND taken_at <= ? ORDER BY taken_at DESC LIMIT 1""",
+            (args.id, row["starts_at"]),
+        ).fetchone()
+        if last:
+            closing = last["odds"]
+
     pnl = {"win": row["stake"] * (row["odds_nike"] - 1), "loss": -row["stake"], "void": 0.0}
     conn.execute(
         "UPDATE bets SET result = ?, pnl = ?, settled_at = ?, odds_close = COALESCE(?, odds_close) WHERE id = ?",
-        (args.result, pnl[args.result], now_iso(), args.odds_close, args.id),
+        (args.result, pnl[args.result], now_iso(), closing, args.id),
     )
     if args.odds_close:
         conn.execute(
@@ -285,6 +296,77 @@ def cmd_bulk_add(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
     print(f"zapísaných {added}, preskočených ako duplicita {skipped}  [{stake_note}]")
 
 
+SPORT_IDS = {"tennis": 7, "darts": 88, "snooker": 85, "basketball": 5,
+             "table-tennis": 61}
+
+
+def cmd_refresh(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    """Re-read Nike's current price for every open bet and store a snapshot.
+
+    A single price captured once is not a record of anything: odds move as money
+    and team news arrive, so a selection written down a day early may bear no
+    relation to what was available at the off. Repeated snapshots turn that
+    unknown into a measurement -- they show how far the line drifted, and the
+    last one taken before the start is the closing price that CLV needs.
+
+    Run it often while bets are open, and once as late as possible before each
+    start.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import nike_odds
+
+    open_bets = conn.execute(
+        "SELECT * FROM bets WHERE result IS NULL AND bet_id IS NOT NULL"
+    ).fetchall()
+    if not open_bets:
+        print("žiadne otvorené stávky")
+        return
+
+    wanted = {r["sport"] for r in open_bets}
+    current: dict[tuple[str, str], float] = {}
+    for sport in sorted(wanted):
+        sport_id = SPORT_IDS.get(sport)
+        if sport_id is None:
+            continue
+        try:
+            offer = nike_odds.offer(sport_id, None, live=False, depth=args.depth,
+                                    max_events=args.max_events)
+        except SystemExit:
+            print(f"  {sport}: ponuku sa nepodarilo načítať", file=sys.stderr)
+            continue
+        for row in nike_odds.rows(offer, None):
+            current[(row["bet_id"], row["selection"])] = row["odds"]
+
+    moved = unchanged = gone = 0
+    drift = []
+    for bet in open_bets:
+        odds = current.get((bet["bet_id"], bet["selection"]))
+        if odds is None:
+            gone += 1
+            continue
+        last = conn.execute(
+            "SELECT odds FROM odds_snapshots WHERE bet_ref = ? ORDER BY id DESC LIMIT 1",
+            (bet["id"],),
+        ).fetchone()
+        if last and abs(last["odds"] - odds) < 1e-9:
+            unchanged += 1
+            continue
+        conn.execute(
+            "INSERT INTO odds_snapshots (bet_ref, taken_at, odds, source) VALUES (?,?,?,?)",
+            (bet["id"], now_iso(), odds, "nike"),
+        )
+        moved += 1
+        drift.append((abs(odds - bet["odds_nike"]) / bet["odds_nike"], bet, odds))
+    conn.commit()
+
+    print(f"otvorených {len(open_bets)}: {moved} sa pohlo, {unchanged} bez zmeny, "
+          f"{gone} už nie je v ponuke")
+    for _, bet, odds in sorted(drift, reverse=True, key=lambda d: d[0])[:10]:
+        shift = (odds - bet["odds_nike"]) / bet["odds_nike"]
+        print(f"  #{bet['id']:<4d} {bet['event'][:34]:34s} {bet['selection'][:18]:18s} "
+              f"{bet['odds_nike']:5.2f} -> {odds:5.2f}  {shift:+.1%}")
+
+
 def cmd_export(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
     """Write the committed, reviewable copy of the history.
 
@@ -372,6 +454,11 @@ def main() -> None:
 
     p = sub.add_parser("stats", help="hit rate, ROI, CLV, calibration")
     p.add_argument("--sport")
+
+    p = sub.add_parser("refresh",
+                       help="re-read current odds for open bets and snapshot them")
+    p.add_argument("--depth", choices=("full", "primary"), default="primary")
+    p.add_argument("--max-events", type=int, default=600)
 
     p = sub.add_parser("bulk-add", help="record a batch from consensus.py CSV output")
     p.add_argument("--csv", default="-", help="path, or - for stdin (default)")
