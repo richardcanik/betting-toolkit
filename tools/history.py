@@ -16,7 +16,7 @@ import csv
 import os
 import sqlite3
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 DB_PATH = Path(
@@ -61,6 +61,16 @@ CREATE TABLE IF NOT EXISTS odds_snapshots (
 CREATE INDEX IF NOT EXISTS idx_bets_open ON bets(result) WHERE result IS NULL;
 CREATE INDEX IF NOT EXISTS idx_snapshots_bet ON odds_snapshots(bet_ref);
 """
+
+
+def parse_start(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        stamp = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return stamp if stamp.tzinfo else stamp.astimezone()
 
 
 def now_iso() -> str:
@@ -309,8 +319,15 @@ def cmd_refresh(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
     unknown into a measurement -- they show how far the line drifted, and the
     last one taken before the start is the closing price that CLV needs.
 
-    Run it often while bets are open, and once as late as possible before each
-    start.
+    What the payout depends on is only the price taken, which is already stored.
+    The reason to look again is different: the last price before the off is the
+    market's final estimate of the probability, so comparing it against the price
+    taken says whether the selection beat the market -- a question that answers
+    itself after tens of bets, where win/loss needs hundreds.
+
+    That makes intermediate snapshots optional. Passing --starting-within limits
+    the refresh to bets about to begin, which is the only snapshot that has to be
+    caught, because after the start it is gone for good.
     """
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import nike_odds
@@ -318,8 +335,17 @@ def cmd_refresh(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
     open_bets = conn.execute(
         "SELECT * FROM bets WHERE result IS NULL AND bet_id IS NOT NULL"
     ).fetchall()
+    if args.starting_within is not None:
+        cutoff = datetime.now(timezone.utc) + timedelta(minutes=args.starting_within)
+        now = datetime.now(timezone.utc)
+        picked = []
+        for bet in open_bets:
+            start = parse_start(bet["starts_at"])
+            if start and now <= start <= cutoff:
+                picked.append(bet)
+        open_bets = picked
     if not open_bets:
-        print("žiadne otvorené stávky")
+        print("žiadne otvorené stávky v tomto okne")
         return
 
     wanted = {r["sport"] for r in open_bets}
@@ -459,6 +485,9 @@ def main() -> None:
                        help="re-read current odds for open bets and snapshot them")
     p.add_argument("--depth", choices=("full", "primary"), default="primary")
     p.add_argument("--max-events", type=int, default=600)
+    p.add_argument("--starting-within", type=int, metavar="MIN",
+                   help="only bets starting within this many minutes -- the "
+                        "closing snapshot, which is the one that cannot be missed")
 
     p = sub.add_parser("bulk-add", help="record a batch from consensus.py CSV output")
     p.add_argument("--csv", default="-", help="path, or - for stdin (default)")
