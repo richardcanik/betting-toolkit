@@ -29,7 +29,14 @@ Three details are not obvious and were established by reading the site's own bun
    same request returns `400`.
 3. **Only leaf boxes are queryable.** Menu nodes whose id ends in `-null`
    (`bi-7-18-null`, `bi-5-null-null`) are groupings for display; asking for their
-   offer returns `400`. Filter to nodes with a non-zero match count.
+   offer returns `400`.
+
+4. **The menu tree must be walked to its leaves.** Depth is not uniform: under Tenis,
+   `bi-7-18-157` (US Open - muži) is a direct child of the sport and is a real
+   tournament, while `bi-7-1298-null` (Challenger) is a sibling that reports zero
+   matches and carries fourteen tournaments one level below. Reading only the sport's
+   direct children finds 4 tennis tournaments; walking to the leaves finds 61. Filter
+   on a non-zero match count *after* reaching the leaves, never before.
 
 The web client also appends a `ts` parameter whose value is a second-precision
 timestamp in milliseconds where the last three digits sum to 14 — a lightweight bot
@@ -92,6 +99,29 @@ change by patching only the code.
 ticket paths; `/tipovanie/*` and the API gateway are not disallowed. Requests are made
 at human rates — a handful per analysis, never a continuous poll. There is no scraping
 of account, ticket or any other authenticated surface.
+
+### Niké's margin ladder
+
+Margin is not uniform across the offer, and it maps to how exposed Niké feels rather
+than to how big the event is. Measured on the match-winner market, 2026-09-08:
+
+| Tier | Median margin |
+|---|---|
+| Grand Slam (US Open) | ~4.1 % |
+| Boosted "Superšanca" | ~2.2 % |
+| WTA 125 and Challenger | ~8.0 % |
+| ITF | ~10.0 % |
+
+This inverts the usual intuition that small tournaments are where a soft book is
+beatable. Niké protects itself with margin precisely where it is least confident, so
+on an ITF match the price must be more than five percentage points wrong on a two-way
+market before the bet is even break-even — and that is exactly where the least
+information is available to establish that it is wrong. Obscurity raises the cost of
+being right at the same time as it raises the chance the line is stale.
+
+The practical consequence is to look for value where margin is low and a comparison
+price exists, and to treat the deep lower tiers as a place that needs a much larger
+demonstrated edge, not a smaller one.
 
 ## 2. Comparison books (line shopping and consensus)
 

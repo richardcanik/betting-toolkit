@@ -93,23 +93,49 @@ def now_iso() -> str:
 
 
 def tournaments(sport_id: int | None, date: str | None) -> list[dict]:
-    """Leaf boxes (tournaments) of the menu tree, optionally for one sport."""
+    """Every queryable tournament, found by walking the whole menu tree.
+
+    The tree is deeper than it looks. A sport's direct children mix real
+    tournaments with groupings that carry the actual tournaments another level
+    down: under Tenis, ``bi-7-18-157`` (US Open - muzi) is a leaf, while
+    ``bi-7-1298-null`` (Challenger) reports zero matches and hides fourteen
+    tournaments beneath it. Reading only the first two levels therefore misses
+    most of the offer -- for tennis, 57 tournaments out of 61.
+
+    Only leaves are returned, because a grouping is not queryable: asking for
+    its offer makes the gateway answer 400.
+    """
     menu = get("/v1/menu", live=True, prematch=True, showMatchCounts=True, date=date)
-    out = []
+
+    out: list[dict] = []
+
+    def walk(node: dict, sport: dict, depth: int = 0) -> None:
+        children = node.get("items") or []
+        if children:
+            for child in children:
+                walk(child, sport, depth + 1)
+            return
+        if depth == 0:
+            return  # the sport itself, with nothing under it
+        out.append(
+            {
+                "sportId": int(sport["sportId"]),
+                "sport": sport["label"],
+                "boxId": node["boxId"],
+                "tournament": node["label"],
+                "matches": node.get("matchesCount", 0),
+            }
+        )
+
     for sport in menu.get("items", []):
         if sport_id is not None and int(sport["sportId"]) != sport_id:
             continue
-        for item in sport.get("items", []):
-            out.append(
-                {
-                    "sportId": int(sport["sportId"]),
-                    "sport": sport["label"],
-                    "boxId": item["boxId"],
-                    "tournament": item["label"],
-                    "matches": item.get("matchesCount", 0),
-                }
-            )
-    return out
+        walk(sport, sport)
+
+    # A tournament can appear both directly under the sport and again under a
+    # grouping; keep the first sighting of each box.
+    seen: set[str] = set()
+    return [t for t in out if not (t["boxId"] in seen or seen.add(t["boxId"]))]
 
 
 def event_markets(event_id: str) -> dict:
