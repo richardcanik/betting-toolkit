@@ -36,6 +36,29 @@ timestamp in milliseconds where the last three digits sum to 14 — a lightweigh
 check. It is not currently enforced server-side, but `tools/nike_odds.py` sends a
 valid one anyway so that the traffic matches what the site itself produces.
 
+### Depth: the primary markets are not the offer
+
+`/v1/boxes/search/mobile` returns only each match's **primary** markets. Reading just
+those hides most of the offer, and in particular hides the one place Niké prices
+generously:
+
+- **Superšanca** — a boosted market that appears alongside the standard one on a
+  handful of matches, at roughly 2 % margin instead of the standard 4 %, and which is
+  better than the standard price **on both sides**. On the 2026-09-09 US Open
+  quarterfinals it paid 7.34 instead of 7.20, 1.29 instead of 1.27, 3.47 instead of
+  3.40. Never quote a Niké price without checking whether a Superšanca exists for that
+  match; the standard market is simply the worse version of the same bet.
+- **Derivative markets** — set and game handicaps, totals, exact score. These carry
+  around 8 % margin against the headline market's 4 %, so they are usually the wrong
+  place to look, but they cannot be ruled out without being read.
+
+`tools/nike_odds.py offer` therefore fetches every event in full by default, at roughly
+50 markets per match. `--depth primary` is the opt-out, and a `--max-events` guard
+refuses an accidental full sweep of a sport like football (about 700 events).
+
+`/v1/matches/special/superoffer` sounds like the boosted offer and is not: it returns
+**featured** matches at standard prices. It is not a source of value.
+
 ### Response shape
 
 `/v1/boxes/search/mobile` returns four parallel lists that must be joined by id:
@@ -45,6 +68,11 @@ valid one anyway so that the traffic matches what the site itself produces.
 - `bets` — one entry per market offered on a match, joined via `sportEventId`. The
   prices live in `selectionGrid`, a grid of cells each carrying `odds`, `name`, `tip`,
   and the `enabled`/`locked` flags that say whether the price is actually takeable.
+
+  **One bet can hold more than one market.** The grid's rows are independent: a
+  basketball `Zápas` bet carries 1X2 on row 0 and the double chance on row 1. Anything
+  computed across a whole bet rather than per row — a margin, a de-vigged probability —
+  is meaningless. Group by grid row.
 - `markets` — market metadata, joined via `marketId`. Market `367` is
   "Víťaz zápasu" (match winner).
 - `boxes` — the tournament container itself.

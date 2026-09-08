@@ -26,9 +26,16 @@ Python 3 standard library only — no dependencies, no build step.
 ```
 tools/nike_odds.py days                                 # days with an offer
 tools/nike_odds.py tournaments --sport tennis           # tournaments and their box ids
-tools/nike_odds.py offer --sport tennis --market "Víťaz zápasu"
+tools/nike_odds.py offer --sport tennis                  # every market of every event
+tools/nike_odds.py offer --sport football --depth primary   # headline markets only
 tools/nike_odds.py event 1017349044                     # every market for one match
 ```
+
+`offer` sweeps each event in full by default, so boosted (Superšanca) and derivative
+markets are included; `--depth primary` is the fast path for sports with a large
+offer. Every row carries its market's margin, which is the cheapest way to spot where
+Niké is pricing sharply — boosts sit near 2 %, the headline market near 4 %,
+derivatives near 8 %.
 
 Add `-f csv` or `-f json` for machine-readable output.
 

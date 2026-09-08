@@ -19,6 +19,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 BASE = "https://m.nike.sk/api-gw/nikeone"
@@ -111,13 +112,44 @@ def tournaments(sport_id: int | None, date: str | None) -> list[dict]:
     return out
 
 
-def offer(sport_id: int | None, date: str | None, live: bool) -> dict:
-    """Every prematch event + its primary-market odds for a sport and day."""
+def event_markets(event_id: str) -> dict:
+    """Every market of one match, including Supersanca and the derivatives.
+
+    One failing event must not abandon the sweep, so an API error is reported
+    and skipped rather than raised.
+    """
+    try:
+        return get(
+            "/v1/boxes/extended/sport-event-id",
+            sportEventId=event_id,
+            hideCollapsedMarkets=False,
+        )
+    except ApiError as exc:
+        print(f"skipping event {event_id}: {exc}", file=sys.stderr)
+        return {}
+
+
+def offer(
+    sport_id: int | None,
+    date: str | None,
+    live: bool,
+    depth: str = "full",
+    max_events: int = 120,
+    workers: int = 5,
+) -> dict:
+    """The complete offer for a sport and day.
+
+    The tournament search only returns each match's *primary* markets. Doing that
+    alone hides two things that matter: Nike's boosted "Supersanca" prices, which
+    beat the standard market on both sides, and every derivative market. So by
+    default each event found is then fetched in full, and `depth="primary"` is
+    the opt-out for sports whose offer is too large to sweep.
+    """
     # Parent boxes (``bi-7-18-null``) are menu groupings, not queryable offers --
     # asking for one makes the gateway answer 400, so only leaf boxes are fetched.
     boxes = [t["boxId"] for t in tournaments(sport_id, date) if t["matches"]]
     events: dict[str, dict] = {}
-    bets: list[dict] = []
+    bets: dict[str, dict] = {}
     for box in boxes:
         try:
             data = get(
@@ -133,19 +165,41 @@ def offer(sport_id: int | None, date: str | None, live: bool) -> dict:
             continue
         for event in data.get("sportEvents", []):
             events.setdefault(event["sportEventId"], event)
-        bets.extend(data.get("bets", []))
-    return {"fetched_at": now_iso(), "events": events, "bets": bets}
+        for bet in data.get("bets", []):
+            bets.setdefault(bet["betId"], bet)
+
+    if depth == "full" and events:
+        if len(events) > max_events:
+            sys.exit(
+                f"{len(events)} events is more than --max-events {max_events}; "
+                f"raise it to sweep them all, or use --depth primary"
+            )
+        print(f"sweeping all markets for {len(events)} events...", file=sys.stderr)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for data in pool.map(event_markets, list(events)):
+                for event in data.get("sportEvents", []):
+                    events.setdefault(event["sportEventId"], event)
+                for bet in data.get("bets", []):
+                    bets[bet["betId"]] = bet
+
+    return {"fetched_at": now_iso(), "events": events, "bets": list(bets.values())}
 
 
 def selections(bet: dict) -> list[dict]:
-    """Flatten a bet's selection grid into ``{tip, name, odds}`` rows."""
+    """Flatten a bet's selection grid into ``{row, tip, name, odds}`` entries.
+
+    The grid row is kept because a single bet can carry two independent markets
+    as separate rows -- a basketball "Zapas" holds 1X2 on row 0 and the double
+    chance on row 1. Treating them as one market gives a nonsense margin.
+    """
     out = []
-    for row in bet.get("selectionGrid", []) or []:
+    for index, row in enumerate(bet.get("selectionGrid", []) or []):
         for cell in row:
             if cell.get("type") != "selection" or cell.get("odds") is None:
                 continue
             out.append(
                 {
+                    "row": index,
                     "tip": cell.get("tip"),
                     "name": cell.get("name"),
                     "odds": float(cell["odds"]),
@@ -155,17 +209,57 @@ def selections(bet: dict) -> list[dict]:
     return out
 
 
+# A complete market's implied probabilities sum to a little over 1. Anything far
+# above that is two markets added together; anything below 1 would be arbitrage,
+# which does not occur inside a single book.
+MARGIN_BAND = (1.0, 1.75)
+
+
+def market_margins(sels: list[dict]) -> dict[int, float | None]:
+    """Margin for each selection's market, keyed by grid row.
+
+    The selection grid is a display layout, not a grouping: sometimes one market
+    is spread over several rows (a best-of-five exact score, three rows of two),
+    and sometimes one bet holds two independent markets (basketball 1X2 on row 0,
+    double chance on row 1). Neither reading is universally right, so the grouping
+    is chosen by which one produces a plausible margin.
+    """
+    if not sels or any(not s["enabled"] for s in sels):
+        return {s["row"]: None for s in sels}  # incomplete: no honest margin
+
+    rows_present = sorted({s["row"] for s in sels})
+    whole = sum(1 / s["odds"] for s in sels)
+    if len(sels) > 1 and MARGIN_BAND[0] <= whole <= MARGIN_BAND[1]:
+        return {r: round(whole - 1, 4) for r in rows_present}
+
+    per_row = {}
+    for index in rows_present:
+        row = [s for s in sels if s["row"] == index]
+        total = sum(1 / s["odds"] for s in row)
+        per_row[index] = (
+            round(total - 1, 4)
+            if len(row) > 1 and MARGIN_BAND[0] <= total <= MARGIN_BAND[1]
+            else None
+        )
+    return per_row
+
+
 def rows(data: dict, market: str | None) -> list[dict]:
-    """One row per selection, joined to its event. The table you actually read."""
+    """One row per selection, joined to its event. The table you actually read.
+
+    Each row carries its market's margin, because that is the cheapest signal of
+    where Nike is pricing sharply: the boosted markets sit near 2 % while the
+    standard match winner sits near 4 % and the derivatives near 8 %.
+    """
     out = []
     for bet in data["bets"]:
         header = bet.get("header", "")
         if market and market.lower() not in header.lower():
             continue
         event = data["events"].get(bet.get("sportEventId"), {})
-        for sel in selections(bet):
-            if not sel["enabled"]:
-                continue
+        all_sels = selections(bet)
+        margins = market_margins(all_sels)
+        for sel in (s for s in all_sels if s["enabled"]):
             out.append(
                 {
                     "start": event.get("expiration", bet.get("expirationTime", "")),
@@ -176,6 +270,7 @@ def rows(data: dict, market: str | None) -> list[dict]:
                     "selection": sel["name"],
                     "odds": sel["odds"],
                     "implied": round(1 / sel["odds"], 4),
+                    "margin": margins[sel["row"]],
                     "event_id": bet.get("sportEventId", ""),
                     "bet_id": bet.get("betId", ""),
                     "tip": sel["tip"],
@@ -225,11 +320,19 @@ def main() -> None:
     p.add_argument("--sport", choices=sorted(SPORTS))
     p.add_argument("--date")
 
-    p = sub.add_parser("offer", parents=[common], help="events and odds for a sport and day")
+    p = sub.add_parser("offer", parents=[common],
+                       help="every market of every event for a sport and day")
     p.add_argument("--sport", choices=sorted(SPORTS), required=True)
     p.add_argument("--date", help="YYYY-MM-DD, default: whatever Nike serves")
     p.add_argument("--market", help="substring filter, e.g. 'Víťaz'")
     p.add_argument("--live", action="store_true")
+    p.add_argument("--depth", choices=("full", "primary"), default="full",
+                   help="full (default) sweeps every market of every event; "
+                        "primary is the headline markets only")
+    p.add_argument("--max-events", type=int, default=120,
+                   help="refuse a full sweep larger than this (default 120)")
+    p.add_argument("--workers", type=int, default=5,
+                   help="parallel event fetches (default 5)")
 
     p = sub.add_parser("event", parents=[common], help="every market for one sportEventId")
     p.add_argument("event_id")
@@ -252,11 +355,15 @@ def run(args: argparse.Namespace) -> None:
         emit(tournaments(sport, args.date), args.format)
 
     elif args.cmd == "offer":
-        data = offer(SPORTS[args.sport], args.date, args.live)
+        data = offer(
+            SPORTS[args.sport], args.date, args.live,
+            depth=args.depth, max_events=args.max_events, workers=args.workers,
+        )
         emit(
             rows(data, args.market),
             args.format,
-            ["start", "event", "market", "selection", "odds", "implied", "event_id", "bet_id"],
+            ["start", "event", "market", "selection", "odds", "implied", "margin",
+             "event_id", "bet_id"],
         )
 
     elif args.cmd == "event":
@@ -273,7 +380,7 @@ def run(args: argparse.Namespace) -> None:
         emit(
             rows(data, args.market),
             args.format,
-            ["market", "selection", "odds", "implied", "bet_id"],
+            ["market", "selection", "odds", "implied", "margin", "bet_id"],
         )
 
 

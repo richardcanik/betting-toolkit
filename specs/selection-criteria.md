@@ -9,6 +9,9 @@ A selection is a candidate only if all of the following hold:
   advantage, and the bet is noise.
 - The price is actually takeable — the selection's cell is `enabled` and not `locked`
   in the Niké offer.
+- The price is the **best** one Niké offers for that selection. Where a Superšanca
+  exists it beats the standard market on both sides, and quoting the standard price
+  understates the edge by a percentage point or more (see `specs/data-sources.md`).
 
 Where two candidates have similar edge, the one with the narrower probability range
 (higher confidence) ranks first. A large edge derived from a wide range ranks below a
