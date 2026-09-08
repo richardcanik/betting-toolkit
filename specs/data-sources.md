@@ -123,7 +123,53 @@ The practical consequence is to look for value where margin is low and a compari
 price exists, and to treat the deep lower tiers as a place that needs a much larger
 demonstrated edge, not a smaller one.
 
-## 2. Comparison books (line shopping and consensus)
+## 2. Smarkets exchange (fair probability)
+
+`https://api.smarkets.com/v3` — public, no API key, no account.
+
+An exchange is people betting against each other rather than against a book. It takes
+commission from winnings instead of building a margin into the price, so its prices
+already sum to 1 and need no de-vigging: **the mid of the best bid and the best offer
+is the fair probability**, which is exactly the anchor `specs/market-model.md` asks
+for. `tools/consensus.py` reads it.
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /events/?type=tennis_match&state=upcoming` | upcoming events of one sport |
+| `GET /events/{ids}/markets/` | markets; `WINNER_2_WAY` is the match winner |
+| `GET /markets/{ids}/contracts/` | the named outcomes |
+| `GET /markets/{ids}/quotes/` | the order book, as bids and offers |
+
+Ids may be comma-separated, about twenty at a time, which turns hundreds of requests
+into a handful. Quote prices are hundredths of a percent: `4167` means 41.67 %.
+
+**Pagination never terminates on its own.** `next_page` keeps being returned after the
+last page and the same events repeat, so following the cursor until it disappears is an
+infinite loop. Stop when a page contributes no event id that has not been seen.
+
+### The binding constraint is liquidity, not coverage
+
+Smarkets lists plenty of events but prices few of them tightly. Measured 2026-09-08:
+
+| Sport | Markets | Median bid/offer spread | Within 4 points |
+|---|---|---|---|
+| Tennis | 95 | 12.3 % | 15 |
+| Darts | 15 | 15.3 % | 0 |
+
+A market quoted 16 % bid against 31 % offer has no usable midpoint — the gap is five
+times the edge being hunted, so any "edge" measured against it is smaller than the
+uncertainty in it. An early run produced exactly this false positive: a doubles match
+appearing to offer +3.10 % edge, on a book with a 14.6-point spread. `consensus.py`
+therefore drops any market wider than `--max-spread` (default 4 points).
+
+The consequence is uncomfortable and worth stating plainly: **Smarkets is liquid
+precisely where Niké is already efficient** — the marquee matches — and illiquid across
+the lower tiers where a stale line is plausible. It verifies the matches that need no
+verifying. Reaching the rest needs a deeper source: Betfair, which is far larger but
+requires an account and an application key, or The Odds API, which aggregates
+bookmakers including Pinnacle and requires a free key.
+
+## 3. Comparison books (line shopping and consensus)
 
 Tipos and Fortuna are used for two distinct purposes that must not be confused:
 
@@ -135,7 +181,7 @@ These are not yet automated. Until they are, their odds are read manually and re
 with the time they were observed, because an odds quote without a timestamp is not
 evidence of anything.
 
-## 3. Context and statistics
+## 4. Context and statistics
 
 Flashscore and Sofascore for form, head-to-head, schedule and injury news;
 Tennis Abstract for surface-split tennis data; Basketball-Reference for NBA;
