@@ -16,7 +16,6 @@ import gzip
 import json
 import sys
 import time
-import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -24,6 +23,7 @@ from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
 import nike_odds  # noqa: E402
+from names import same_person, tokens  # noqa: E402,F401
 
 SMARKETS = "https://api.smarkets.com/v3"
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
@@ -69,28 +69,6 @@ def sm_get(path: str, **params) -> dict:
 
 
 # --- name matching ---------------------------------------------------------
-
-
-def tokens(name: str) -> set[str]:
-    """Comparable name parts: lowercased, unaccented, initials dropped.
-
-    The two sources write names differently -- Nike has "Sorribes Tormo S." and
-    "Zheng Qinwen", Smarkets has "Sara Sorribes Tormo" and "Qinwen Zheng". Whole
-    tokens are compared rather than a guessed surname, because which part is the
-    surname varies by naming convention.
-    """
-    flat = unicodedata.normalize("NFKD", name.lower())
-    flat = "".join(c for c in flat if not unicodedata.combining(c))
-    out = set()
-    for part in flat.replace(".", " ").replace("-", " ").replace("/", " ").split():
-        if len(part) > 1:
-            out.add(part)
-    return out
-
-
-def same_person(a: str, b: str) -> bool:
-    ta, tb = tokens(a), tokens(b)
-    return bool(ta & tb)
 
 
 def same_match(nike_sides: list[str], sm_name: str) -> bool:

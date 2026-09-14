@@ -85,6 +85,25 @@ def get(path: str, **params) -> dict:
     return json.loads(raw)
 
 
+def client_context() -> dict:
+    """What Nike thinks of the caller: its IP, country, and mitigation mode.
+
+    Nike serves a different `mitigation.mode` by country, so this is how to find
+    out whether the offer is reachable from wherever the code happens to run --
+    a CI runner abroad, for instance, rather than a Slovak connection.
+    """
+    req = urllib.request.Request(
+        "https://m.nike.sk/api/v1/client-config",
+        headers={"User-Agent": UA, "Accept": "application/json",
+                 "Accept-Encoding": "gzip", "Referer": "https://m.nike.sk/"},
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        raw = resp.read()
+        if resp.headers.get("Content-Encoding") == "gzip":
+            raw = gzip.decompress(raw)
+    return json.loads(raw)
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
@@ -339,6 +358,9 @@ def main() -> None:
     common.add_argument("-f", "--format", choices=("table", "csv", "json"), default="table")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
+    sub.add_parser("check", parents=[common],
+                   help="is the API reachable from here, and how does Nike see us")
+
     sub.add_parser("days", parents=[common],
                    help="betting days Nike currently has an offer for")
 
@@ -372,7 +394,24 @@ def main() -> None:
 
 
 def run(args: argparse.Namespace) -> None:
-    if args.cmd == "days":
+    if args.cmd == "check":
+        context = client_context()
+        client = context.get("clientContext", {})
+        mitigation = context.get("mitigation", {})
+        offer = tournaments(SPORTS["tennis"], None)
+        playable = [t for t in offer if t["matches"]]
+        rows = [
+            {"položka": "IP", "hodnota": client.get("ip", "?")},
+            {"položka": "krajina", "hodnota": client.get("countryCode", "?")},
+            {"položka": "mitigation.mode", "hodnota": mitigation.get("mode", "?")},
+            {"položka": "tenisové turnaje", "hodnota": len(offer)},
+            {"položka": "z toho s ponukou", "hodnota": len(playable)},
+        ]
+        emit(rows, args.format)
+        if not playable:
+            sys.exit("ponuka je prázdna -- pravdepodobne blokované z tejto siete")
+
+    elif args.cmd == "days":
         days = get("/v1/init-data/mobile").get("bettingDays", [])
         emit([{"date": d} for d in days], args.format)
 

@@ -200,7 +200,34 @@ def cmd_stats(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
     expected = sum(r["p_est_low"] for r in rows)
     print(f"settled      {len(rows)}")
     print(f"hit rate     {wins / len(rows):.1%}  (model expected {expected / len(rows):.1%})")
-    print(f"ROI          {pnl / staked:+.1%}  ({pnl:+.2f} units on {staked:.2f} staked)")
+
+    # Both sides of every match are recorded, which is right for calibration and
+    # fatal for a return figure: backing both sides of a market loses the margin
+    # by arithmetic, no matter how good the method is. So the return is reported
+    # over the selections that actually cleared the edge threshold -- the ones
+    # that would have been bet -- while calibration keeps the whole record.
+    would_bet = [r for r in rows if r["edge"] >= args.threshold]
+    if would_bet:
+        got = sum((r["odds_nike"] - 1) if r["result"] == "win" else -1.0
+                  for r in would_bet)
+        print(f"ROI (edge>={args.threshold:.0%})  {got / len(would_bet):+.1%}  "
+              f"na {len(would_bet)} tipoch, ktoré by sa reálne stavili")
+    else:
+        print(f"ROI (edge>={args.threshold:.0%})  žiadny tip neprešiel prahom, "
+              f"niet čo počítať")
+
+    if staked > 0:
+        print(f"ROI          {pnl / staked:+.1%}  ({pnl:+.2f} units on {staked:.2f} staked)")
+    else:
+        # Paper trading stakes nothing, so returns are shown notionally: what one
+        # flat unit per selection would have done. Without this the whole record
+        # reports a zero return and says nothing.
+        notional = sum(
+            (r["odds_nike"] - 1) if r["result"] == "win" else -1.0 for r in rows
+        )
+        print(f"ROI všetkých {notional / len(rows):+.1%}  "
+              f"({notional:+.2f} j. na {len(rows)} záznamoch — obsahuje obe strany "
+              f"každého zápasu, takže meria maržu, nie metódu)")
 
     priced = [r for r in rows if r["odds_close"]]
     if priced:
@@ -210,13 +237,24 @@ def cmd_stats(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
     else:
         print("CLV          no closing odds recorded yet")
 
-    print("\ncalibration by stated confidence")
-    band = conn.execute(
-        f"""SELECT confidence, COUNT(*) n,
-                   AVG(result = 'win') hit, AVG(p_est_low) expected,
-                   SUM(pnl) / SUM(stake) roi
-            FROM bets {clause} GROUP BY confidence""", params).fetchall()
-    show(band, ["confidence", "n", "hit", "expected", "roi"])
+    print("\ncalibration by stated confidence (roi = flat 1 unit per selection)")
+    bands: dict[str, list] = {}
+    for row in rows:
+        bands.setdefault(row["confidence"], []).append(row)
+    show(
+        [
+            {
+                "confidence": name,
+                "n": len(group),
+                "hit": sum(r["result"] == "win" for r in group) / len(group),
+                "expected": sum(r["p_est_low"] for r in group) / len(group),
+                "roi": sum((r["odds_nike"] - 1) if r["result"] == "win" else -1.0
+                           for r in group) / len(group),
+            }
+            for name, group in sorted(bands.items())
+        ],
+        ["confidence", "n", "hit", "expected", "roi"],
+    )
 
     print("\nfactor breakdown (which drivers actually work)")
     counts: dict[str, list[int]] = {}
@@ -393,6 +431,89 @@ def cmd_refresh(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
               f"{bet['odds_nike']:5.2f} -> {odds:5.2f}  {shift:+.1%}")
 
 
+def cmd_settle(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    """Close finished bets using Nike's own results.
+
+    Matching is by event id and participant name, never by bet id: Nike issues a
+    different bet id for the settled market than it did for the prematch one, so
+    the id recorded when the selection was made no longer resolves.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import nike_odds
+    from names import same_person
+
+    now = datetime.now(timezone.utc)
+    pending = [
+        bet for bet in conn.execute(
+            "SELECT * FROM bets WHERE result IS NULL AND event_id IS NOT NULL")
+        if (start := parse_start(bet["starts_at"])) and start < now
+    ]
+    if not pending:
+        print("žiadne skončené stávky na uzavretie")
+        return
+    print(f"skončených stávok na uzavretie: {len(pending)}")
+
+    outcomes: dict[str, tuple[list[str], int, int]] = {}
+    event_ids = sorted({bet["event_id"] for bet in pending})
+    for chunk in (event_ids[i:i + 20] for i in range(0, len(event_ids), 20)):
+        try:
+            data = nike_odds.get("/v1/boxes/sport-events", sportEventId=chunk,
+                                 live=True, prematch=True, results=True)
+        except nike_odds.ApiError as exc:
+            print(f"  preskakujem dávku: {exc}", file=sys.stderr)
+            continue
+        events = {e["sportEventId"]: e for e in data.get("sportEvents", [])}
+        for bet in data.get("bets", []):
+            event = events.get(bet.get("sportEventId"))
+            result = bet.get("result") or {}
+            if not event or bet.get("bettingState") != "FINISHED":
+                continue
+            participants = event.get("participants") or []
+            if len(participants) != 2:
+                continue
+            home, away = result.get("homeScore"), result.get("awayScore")
+            if home in (None, "") or away in (None, ""):
+                # Finished with no score is a retirement or walkover -- Nike marks
+                # it "V" (vzdal). Such bets are voided rather than graded.
+                if result.get("scoreToShow") == "V":
+                    outcomes[event["sportEventId"]] = (participants, None, None)
+                continue
+            outcomes[event["sportEventId"]] = (participants, int(home), int(away))
+
+    settled = unresolved = 0
+    for bet in pending:
+        found = outcomes.get(bet["event_id"])
+        if not found:
+            unresolved += 1
+            continue
+        participants, home, away = found
+        if home is None:
+            conn.execute(
+                "UPDATE bets SET result = 'void', pnl = 0, settled_at = ?, "
+                "note = COALESCE(note,'') || ' | skreč/kontumácia' WHERE id = ?",
+                (now_iso(), bet["id"]),
+            )
+            settled += 1
+            continue
+        if same_person(bet["selection"], participants[0]):
+            won = home > away
+        elif same_person(bet["selection"], participants[1]):
+            won = away > home
+        else:
+            unresolved += 1
+            continue
+        outcome = "void" if home == away else ("win" if won else "loss")
+        pnl = {"win": bet["stake"] * (bet["odds_nike"] - 1),
+               "loss": -bet["stake"], "void": 0.0}[outcome]
+        conn.execute(
+            "UPDATE bets SET result = ?, pnl = ?, settled_at = ? WHERE id = ?",
+            (outcome, pnl, now_iso(), bet["id"]),
+        )
+        settled += 1
+    conn.commit()
+    print(f"uzavretých {settled}, nedohľadaných {unresolved}")
+
+
 def cmd_export(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
     """Write the committed, reviewable copy of the history.
 
@@ -480,6 +601,10 @@ def main() -> None:
 
     p = sub.add_parser("stats", help="hit rate, ROI, CLV, calibration")
     p.add_argument("--sport")
+    p.add_argument("--threshold", type=float, default=0.03,
+                   help="edge a selection needed to count as bettable (default 0.03)")
+
+    sub.add_parser("settle", help="close finished bets from Nike's results")
 
     p = sub.add_parser("refresh",
                        help="re-read current odds for open bets and snapshot them")
