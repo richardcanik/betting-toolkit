@@ -13,7 +13,9 @@ REPO="${BETTING_REPO:-$HOME/betting-toolkit}"
 STAMP="${XDG_STATE_HOME:-$HOME/.local/state}/betting-toolkit"
 LOCK="$STAMP/collect.lock"
 LAST_RECORD="$STAMP/last-record"
+LAST_BACKUP="$STAMP/last-backup"
 RECORD_EVERY_MIN="${RECORD_EVERY_MIN:-60}"
+BACKUP_EVERY_MIN="${BACKUP_EVERY_MIN:-60}"
 SPORTS="${BETTING_SPORTS:-tennis darts snooker basketball}"
 
 mkdir -p "$STAMP"
@@ -31,9 +33,10 @@ PY=${PYTHON:-python3}
 
 say "--- cyklus začína"
 
-# The database is a local artifact and is not in git, so on a fresh machine it
-# has to be rebuilt from the committed record before anything is written -- or
-# the export at the end would overwrite that record with an empty one.
+# The database on this machine is the record; the collector writes into it
+# directly. It is absent only on a fresh machine or after losing the disk, and
+# then the committed CSV is what it is rebuilt from -- without this the export
+# below would write an empty database straight over that CSV.
 if [ ! -f data/bets.db ]; then
   say "databáza neexistuje, obnovujem ju zo záznamu v gite"
   $PY tools/history.py import --dir data || { say "import zlyhal"; exit 1; }
@@ -59,8 +62,18 @@ else
   say "zápis preskočený (naposledy pred $(( (now - last) / 60 )) min)"
 fi
 
-# The committed CSV is the record; the database is a local artifact.
+# Git is the off-device backup, not the working store, so it does not need
+# writing every quarter hour: that would be a hundred commits a day and a
+# hundred needless writes to an SD card. The database already holds everything.
+last_backup=0
+[ -f "$LAST_BACKUP" ] && last_backup=$(cat "$LAST_BACKUP" 2>/dev/null || echo 0)
+if [ $(( ($(date +%s) - last_backup) / 60 )) -lt "$BACKUP_EVERY_MIN" ]; then
+  say "--- záloha preskočená (ďalšia o $(( BACKUP_EVERY_MIN - ($(date +%s) - last_backup) / 60 )) min)"
+  exit 0
+fi
+
 $PY tools/history.py export >/dev/null || { say "export zlyhal"; exit 1; }
+date +%s > "$LAST_BACKUP"
 
 if git diff --quiet -- data/; then
   say "--- bez zmien"
