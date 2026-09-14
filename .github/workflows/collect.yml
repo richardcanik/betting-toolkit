@@ -57,7 +57,7 @@ jobs:
             echo "Posledný pokus: $(date -u '+%Y-%m-%d %H:%M') UTC"
             echo
             echo '```'
-            python tools/nike_odds.py check 2>&1 || echo "ZLYHALO"
+            bash tools/probe_access.sh 2>&1 || echo "PROBE ZLYHAL"
             echo '```'
           } > data/runner-check.md
           python tools/nike_odds.py check > /dev/null 2>&1
