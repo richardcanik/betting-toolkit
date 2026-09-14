@@ -23,3 +23,12 @@ def tokens(name: str) -> set[str]:
 def same_person(a: str, b: str) -> bool:
     """True when two spellings share at least one full name token."""
     return bool(tokens(a) & tokens(b))
+
+
+def is_pair(name: str) -> bool:
+    """Is this a doubles pair rather than one competitor?
+
+    Both sources join a pair with a slash -- "Jasika O./Tomic B." and
+    "Jasika O / Tomic B" -- so the separator identifies them.
+    """
+    return "/" in name

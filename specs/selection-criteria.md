@@ -29,6 +29,25 @@ process required to produce twenty will pad the list with negative-EV filler, an
 because the filler outnumbers the real selections it will dominate the results and
 make the whole record uninterpretable. Ranking is the useful part; the count is not.
 
+## 2.1 Doubles are excluded
+
+Only matches between single competitors are collected. The reason is not that pairs
+play differently but that their **names cannot be matched reliably**. Participants are
+joined across sources by shared name tokens, which is safe for one person and not for
+a pair: a pair carries two surnames, so it attaches to the wrong exchange event
+whenever one of its players is also entered in the singles draw that day — routine at
+any tournament.
+
+That is not theoretical. A doubles selection was recorded apparently offering **+12.8 %
+edge**, by far the largest ever seen, and it was a mismatched event rather than a
+price. One of the pair was playing singles the same afternoon.
+
+Pairs also fit the sport criteria less cleanly than singles: a partner's form is a
+second source of variance that the market prices better than any outside estimate can.
+
+`consensus.py --doubles` re-enables them, for when name matching demands both members
+of a pair to agree separately rather than either one.
+
 ## 3. Red flags
 
 Discard a candidate when:

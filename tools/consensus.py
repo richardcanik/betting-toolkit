@@ -23,7 +23,7 @@ from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
 import nike_odds  # noqa: E402
-from names import same_person, tokens  # noqa: E402,F401
+from names import is_pair, same_person, tokens  # noqa: E402,F401
 
 SMARKETS = "https://api.smarkets.com/v3"
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
@@ -190,7 +190,7 @@ def fair_probabilities(
 
 
 def compare(sport: str, depth: str, days: int, max_events: int,
-            max_spread: float) -> list[dict]:
+            max_spread: float, doubles: bool = False) -> list[dict]:
     sport_id, event_type = SPORTS[sport]
 
     print(f"načítavam ponuku Niké ({sport})...", file=sys.stderr)
@@ -210,6 +210,13 @@ def compare(sport: str, depth: str, days: int, max_events: int,
     for row in nike_odds.rows(offer, None):
         if row["market"] not in ("Víťaz zápasu", "Superšanca", "Zápas"):
             continue
+        # Doubles are excluded. Names are matched on shared tokens, which is safe
+        # for one competitor and not for a pair: a pair carries two surnames, so
+        # it can attach to the wrong exchange event when one of its players is
+        # also entered in the singles draw that day. That produced a selection
+        # apparently offering +12.8 % edge which was a mismatch, not a price.
+        if not doubles and is_pair(row["selection"]):
+            continue
         side = best.setdefault(row["event_id"], {})
         if row["selection"] not in side or row["odds"] > side[row["selection"]]["odds"]:
             side[row["selection"]] = row
@@ -221,6 +228,8 @@ def compare(sport: str, depth: str, days: int, max_events: int,
         names = list(sides)
         match = next((e for e in events if same_match(names, e["name"])), None)
         if match is None:
+            continue
+        if not doubles and is_pair(match["name"].split(" vs ")[0]):
             continue
         probs = fair[match["id"]]
         for name, row in sides.items():
@@ -261,6 +270,8 @@ def main() -> None:
                    help="full also reads the boosted Superšanca markets (slower)")
     p.add_argument("--days", type=int, default=3, help="exchange horizon (default 3)")
     p.add_argument("--max-events", type=int, default=600)
+    p.add_argument("--doubles", action="store_true",
+                   help="include doubles (off: pair names mismatch too easily)")
     p.add_argument("--max-spread", type=float, default=0.04,
                    help="reject exchange markets wider than this, in probability "
                         "(default 0.04 = 4 percentage points)")
@@ -268,7 +279,7 @@ def main() -> None:
     args = parser.parse_args()
     try:
         rows = compare(args.sport, args.depth, args.days, args.max_events,
-                       args.max_spread)
+                       args.max_spread, doubles=args.doubles)
     except ExchangeError as exc:
         sys.exit(str(exc))
 
