@@ -523,6 +523,27 @@ def cmd_export(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
     """
     target = Path(args.dir)
     target.mkdir(parents=True, exist_ok=True)
+
+    # The CSV is the record; the database is a rebuildable copy of it. If the
+    # database holds less than the file does, something is wrong -- most likely
+    # it was never loaded from the file -- and writing it out would destroy
+    # history that cannot be re-collected, because past odds are unrecoverable.
+    if not args.force:
+        for table in TABLES:
+            path = target / f"{table}.csv"
+            if not path.exists():
+                continue
+            with open(path, newline="", encoding="utf-8") as handle:
+                on_disk = sum(1 for _ in csv.DictReader(handle))
+            in_db = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            if in_db < on_disk:
+                sys.exit(
+                    f"export zastavený: {table} má v databáze {in_db} riadkov, "
+                    f"ale v {path} ich je {on_disk}. Databáza je asi prázdna alebo "
+                    f"neaktuálna -- spusti 'history.py import' alebo, ak to je "
+                    f"naozaj zámer, 'export --force'."
+                )
+
     for table in TABLES:
         cols = columns_of(conn, table)
         rows = conn.execute(f"SELECT * FROM {table} ORDER BY id").fetchall()
@@ -621,6 +642,8 @@ def main() -> None:
 
     p = sub.add_parser("export", help="write the committed CSV copy of the history")
     p.add_argument("--dir", default=str(EXPORT_DIR))
+    p.add_argument("--force", action="store_true",
+                   help="write even if it would shrink the record")
 
     p = sub.add_parser("import", help="rebuild the database from the committed CSVs")
     p.add_argument("--dir", default=str(EXPORT_DIR))

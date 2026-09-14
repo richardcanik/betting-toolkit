@@ -1,0 +1,15 @@
+[Unit]
+Description=Spúšťa zber každých 15 minút
+
+[Timer]
+# Every quarter hour. The script itself decides what is due: the closing
+# snapshot every time, new selections at most hourly.
+OnCalendar=*:0/15
+# The Pi may have been off or asleep; catch up rather than skip silently.
+Persistent=true
+# Do not have every machine hit Nike on the exact same second.
+RandomizedDelaySec=60
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

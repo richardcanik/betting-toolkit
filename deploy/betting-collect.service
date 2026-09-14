@@ -1,0 +1,17 @@
+[Unit]
+Description=Zber kurzov a záznam výberov (betting-toolkit)
+# Nothing to do without a network, and the Pi may boot before it has one.
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/betting-toolkit/deploy/collect.sh
+# The offer and the exchange are both fetched over the network; a stuck request
+# must not hold the lock into the next tick.
+TimeoutStartSec=10min
+Environment=BETTING_REPO=%h/betting-toolkit
+Environment=TZ=Europe/Bratislava
+Nice=10
+# An SD card dies of writes, so keep scratch in RAM.
+PrivateTmp=true
